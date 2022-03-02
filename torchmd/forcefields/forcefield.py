@@ -46,7 +46,7 @@ class _ForceFieldBase(ABC):
 class ForceField:
     def create(mol, prm):
         from torchmd.forcefields.ff_yaml import YamlForcefield
-        from torchmd.forcefields.ff_parmed import ParmedForcefield
+        from torchmd.forcefields.ff_parmed_zgq import ParmedForcefield
 
         parmedext = [".prm", ".prmtop", ".frcmod"]
         yamlext = [".yaml", ".yml"]

@@ -85,6 +85,13 @@ class ParmedForcefield(_ForceFieldBase):
                 break
 
         if params is None:
+            variants = [('X', at2, at3, 'X'), ('X', at3, at2, 'X')]
+            for var in variants:
+                if var in self.prm.dihedral_types:
+                    params = self.prm.dihedral_types[var]
+                    break
+                    
+        if params is None:
             raise RuntimeError(
                 f"Could not find dihedral parameters for ({at1}, {at2}, {at3}, {at4})"
             )
@@ -97,13 +104,22 @@ class ParmedForcefield(_ForceFieldBase):
 
     def get_14(self, at1, at2, at3, at4):
         variants = [(at1, at2, at3, at4), (at4, at3, at2, at1)]
+        params = None
         for var in variants:
             if var in self.prm.dihedral_types:
                 params = self.prm.dihedral_types[var][0]
                 break
+        
+        if params is None:
+            variants = [('X', at2, at3, 'X'), ('X', at3, at2, 'X')]
+            for var in variants:
+                if var in self.prm.dihedral_types:
+                    params = self.prm.dihedral_types[var][0]
+                    break
 
         lj1 = self.prm.atom_types[at1]
         lj4 = self.prm.atom_types[at4]
+        
         return (
             params.scnb,
             params.scee,
@@ -117,6 +133,8 @@ class ParmedForcefield(_ForceFieldBase):
         from itertools import permutations
 
         types = np.array((at1, at2, at3, at4))
+        typesx = np.array((at1, 'X', 'X', at4))
+        xtypes = np.array(('X', at2, at3, 'X'))
         perms = np.array([x for x in list(permutations((0, 1, 2, 3))) if x[2] == 2])
         for p in perms:
             if tuple(types[p]) in self.prm.improper_types:
@@ -124,6 +142,18 @@ class ParmedForcefield(_ForceFieldBase):
                 return params.psi_k, radians(params.psi_eq), 0
             elif tuple(types[p]) in self.prm.improper_periodic_types:
                 params = self.prm.improper_periodic_types[tuple(types[p])]
+                return params.phi_k, radians(params.phase), params.per
+            elif tuple(typesx[p]) in self.prm.improper_types:
+                params = self.prm.improper_types[tuple(typesx[p])]
+                return params.psi_k, radians(params.psi_eq), 0
+            elif tuple(typesx[p]) in self.prm.improper_periodic_types:
+                params = self.prm.improper_periodic_types[tuple(typesx[p])]
+                return params.phi_k, radians(params.phase), params.per
+            elif tuple(xtypes[p]) in self.prm.improper_types:
+                params = self.prm.improper_types[tuple(xtypes[p])]
+                return params.psi_k, radians(params.psi_eq), 0
+            elif tuple(xtypes[p]) in self.prm.improper_periodic_types:
+                params = self.prm.improper_periodic_types[tuple(xtypes[p])]
                 return params.phi_k, radians(params.phase), params.per
 
         raise RuntimeError(f"Could not find improper parameters for key {types}")
