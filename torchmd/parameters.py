@@ -78,6 +78,8 @@ class Parameters:
             termparams["params"] = termparams["params"].type(precision)
 
     def get_exclusions(self, types=("bonds", "angles", "1-4"), fullarray=False):
+        import tables as t
+        
         exclusions = []
         if self.bonds is not None and "bonds" in types:
             exclusions += self.bonds.cpu().numpy().tolist()
@@ -89,13 +91,44 @@ class Parameters:
             npdihedrals = self.dihedrals.cpu().numpy()
             exclusions += npdihedrals[:, [0, 3]].tolist()
         if fullarray:
-            fullmat = np.full((self.natoms, self.natoms), False, dtype=bool)
-            if len(exclusions):
-                exclusions = np.array(exclusions)
-                fullmat[exclusions[:, 0], exclusions[:, 1]] = True
-                fullmat[exclusions[:, 1], exclusions[:, 0]] = True
-                exclusions = fullmat
-        return exclusions
+            if self.natoms > 10000:
+                num = self.natoms
+                filters=t.Filters(complevel = 5, complib='blosc')
+                file = t.open_file("exclusions.h5",mode="w",title="BOOL")
+                partmat = np.full((num, 10000), False, dtype=bool)
+                earray = file.create_earray(file.root, 'data', atom=t.Atom.from_dtype(partmat.dtype), shape=(num,0), filters=filters, expectedrows=num)
+    
+                iteration = np.floor(num/10000)
+                for i in range(int(iteration)):
+                    earray.append(partmat)
+    
+                resmat = np.full((num, int(num-10000*iteration)), False, dtype=bool)
+                earray.append(resmat)
+                fullmat = file.root.data
+                
+                if len(exclusions):
+                    exclusions = np.array(exclusions)
+                    fullmat[exclusions[:, 0], exclusions[:, 1]] = True
+                    fullmat[exclusions[:, 1], exclusions[:, 0]] = True
+                    exclusions = fullmat
+                
+                file.close()     
+                
+                return exclusions
+    
+    
+            else:
+                fullmat = np.full((self.natoms, self.natoms), False, dtype=bool)
+            
+                if len(exclusions):
+                    exclusions = np.array(exclusions)
+                    fullmat[exclusions[:, 0], exclusions[:, 1]] = True
+                    fullmat[exclusions[:, 1], exclusions[:, 0]] = True
+                    exclusions = fullmat
+                    return exclusions
+        
+        else:
+            return exclusions
 
     def build_parameters(self, ff, mol, terms):
         uqatomtypes, indexes = np.unique(mol.atomtype, return_inverse=True)
@@ -125,7 +158,17 @@ class Parameters:
         if "1-4" in terms and len(mol.dihedrals):
             # Keep only dihedrals whos 1/4 atoms are not in bond+angle exclusions
             exclusions = self.get_exclusions(types=("bonds", "angles"), fullarray=True)
-            keep = ~exclusions[uqdihedrals[:, 0], uqdihedrals[:, 3]]
+            if self.natoms > 10000:
+                
+                import tables as t
+                
+                file = t.open_file("exclusions.h5",mode="r")
+                exclusions = file.root.data
+                keep = ~exclusions[uqdihedrals[:, 0], uqdihedrals[:, 3]]
+                file.close()
+            else:
+                keep = ~exclusions[uqdihedrals[:, 0], uqdihedrals[:, 3]]
+                
             dih14 = uqdihedrals[keep, :]
             if len(dih14):
                 # Remove duplicates (can occur if 1,4 atoms were same and 2,3 differed)
