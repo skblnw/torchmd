@@ -1,22 +1,23 @@
 from scipy import constants as const
 import torch
+import yaml
 import numpy as np
 from math import pi
 
 
 class Forces:
     """
-    Parameters
-    ----------
-    cutoff : float
-        If set to a value it will only calculate LJ, electrostatics and bond energies for atoms which are closer
-        than the threshold
-    rfa : bool
-        Use with `cutoff` to enable the reaction field approximation for scaling of the electrostatics up to the cutoff.
-        Uses the value of `solventDielectric` to model everything beyond the cutoff distance as solvent with uniform
-        dielectric.
-    solventDielectric : float
-        Used together with `cutoff` and `rfa`
+        Parameters
+        ----------
+        cutoff : float
+            If set to a value it will only calculate LJ, electrostatics and bond energies for atoms which are closer
+            than the threshold
+        rfa : bool
+            Use with `cutoff` to enable the reaction field approximation for scaling of the electrostatics up to the cutoff.
+            Uses the value of `solventDielectric` to model everything beyond the cutoff distance as solvent with uniform
+            dielectric.
+        solventDielectric : float
+            Used together with `cutoff` and `rfa`
     """
 
     # 1-4 is nonbonded but we put it currently in bonded to not calculate all distances
@@ -37,16 +38,21 @@ class Forces:
     ):
         self.par = parameters
         if terms is None:
-            raise RuntimeError(
-                'Set force terms or leave empty brackets [].\nAvailable options: "bonds", "angles", "dihedrals", "impropers", "1-4", "electrostatics", "lj", "repulsion", "repulsioncg".'
+            terms = (
+                "electrostatics",
+                "lj",
+                "bonds",
+                "angles",
+                "dihedrals",
+                "1-4",
+                "impropers",
             )
-
         self.energies = [ene.lower() for ene in terms]
         for et in self.energies:
             if et not in Forces.terms:
                 raise ValueError(f"Force term {et} is not implemented.")
 
-        if "1-4" in self.energies and "dihedrals" not in self.energies:
+        if "1-4" in self.energies and not "dihedrals" in self.energies:
             raise RuntimeError(
                 "You cannot enable 1-4 interactions without enabling dihedrals"
             )
@@ -322,10 +328,7 @@ class Forces:
             forces[:] = -torch.autograd.grad(
                 enesum, pos, only_inputs=True, retain_graph=True
             )[0]
-            if returnDetails:
-                return pot
-            else:
-                return [torch.sum(torch.cat(list(pp.values()))) for pp in pot]
+            return enesum
 
         if returnDetails:
             return [{k: v.cpu().item() for k, v in pp.items()} for pp in pot]
@@ -333,15 +336,55 @@ class Forces:
             return [np.sum([v.cpu().item() for _, v in pp.items()]) for pp in pot]
 
     def _make_indeces(self, natoms, excludepairs, device):
-        fullmat = np.full((natoms, natoms), True, dtype=bool)
-        if len(excludepairs):
-            excludepairs = np.array(excludepairs)
-            fullmat[excludepairs[:, 0], excludepairs[:, 1]] = False
-            fullmat[excludepairs[:, 1], excludepairs[:, 0]] = False
-        fullmat = np.triu(fullmat, +1)
-        allvsall_indeces = np.vstack(np.where(fullmat)).T
-        ava_idx = torch.tensor(allvsall_indeces).to(device)
-        return ava_idx
+        if natoms > 10000:
+            import tables as t
+            
+            filters=t.Filters(complevel=5, complib='blosc')
+            ffile = t.open_file("findeces.h5", mode="w",title="BOOL")
+            partmat = np.full((natoms,10000),False, dtype=bool)
+            earray = ffile.create_earray(ffile.root, 'data', atom = t.Atom.from_dtype(partmat.dtype), shape=(natoms,0), filters=filters, expectedrows=natoms)
+            
+            iteration = np.floor(natoms/10000)
+            for i in range(int(iteration)):
+                earray.append(partmat)
+                
+            resmat = np.full((natoms, int(natoms-10000*iteration)), False, dtype=bool)
+            earray.append(resmat)
+            fullmat = ffile.root.data
+            
+            if len(excludepairs):
+                excludepairs = np.array(excludepairs)
+                fullmat[excludepairs[:, 0], excludepairs[:, 1]] = False
+                fullmat[excludepairs[:, 1], excludepairs[:, 0]] = False
+            
+            ind = 0
+            aa = np.array([[None, None]])
+            for i in range(natoms):
+                l = fullmat[i]
+                for j in range(i+1, natoms,1):
+                    if l[j] and ind ==0:
+                        aa[ind] = [i,j]
+                        ind = 1
+                    else:
+                        aa=np.append(aa, [[i,j]], axis=0)
+            
+            allvsall_indeces = aa
+
+            ava_idx = torch.tensor(allvsall_indeces).to(device)
+            
+            ffile.close()
+            return ava_idx
+        
+        else:
+            fullmat = np.full((natoms, natoms), True, dtype=bool)
+            if len(excludepairs):
+                excludepairs = np.array(excludepairs)
+                fullmat[excludepairs[:, 0], excludepairs[:, 1]] = False
+                fullmat[excludepairs[:, 1], excludepairs[:, 0]] = False
+            fullmat = np.triu(fullmat, +1)
+            allvsall_indeces = np.vstack(np.where(fullmat)).T
+            ava_idx = torch.tensor(allvsall_indeces).to(device)
+            return ava_idx
 
 
 def wrap_dist(dist, box):
