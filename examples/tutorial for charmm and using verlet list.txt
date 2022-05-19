@@ -1,0 +1,118 @@
+# coding: utf-8
+
+import datetime
+from moleculekit.molecule import Molecule
+import os
+moldir = "/home/data/Torchmd/Sent_sarscov2/Sent_sarscov2/"
+mol = Molecule(os.path.join(moldir,"ionized.psf"))
+mol.read(os.path.join(moldir,"output/cons-6.restart.coor"))
+mol.read(os.path.join(moldir,"output/cons-6.restart.xsc"))
+
+from torchmd.forcefields.forcefield import ForceField
+from torchmd.parameters import Parameters
+import torch
+import parmed
+
+precision = torch.float
+device = "cuda:0"
+ffdir = "/home/data/Torchmd/Sent_sarscov2/Sent_sarscov2/toppar/"
+
+prm = parmed.charmm.CharmmParameterSet(
+                                       os.path.join(ffdir, "par_all36_carb.prm"),
+                                       os.path.join(ffdir, "par_all36_lipid.prm"),
+                                       os.path.join(ffdir, "par_all36_na.prm"),
+                                       os.path.join(ffdir, "par_all36_cgenff.prm"), 
+                                       os.path.join(ffdir, "par_all36_prot.prm"),                                      
+                                       os.path.join(ffdir, "par_all35_ethers.prm"),
+                                       os.path.join(ffdir, "toppar_water_ions.str"))
+
+ff = ForceField.create(mol, prm)
+
+starttime_par = datetime.datetime.now()
+parameters = Parameters(ff, mol, precision=precision, device=device)
+endtime_par = datetime.datetime.now()
+print(endtime_par-starttime_par, 'parameter')
+
+#--->0:22:43.763728 parameter
+
+
+from torchmd.integratorverlet import maxwell_boltzmann
+from torchmd.systems import System
+
+system = System(mol.numAtoms, nreplicas=1, precision=precision, device=device)
+system.set_positions(mol.coords)
+system.set_box(mol.box)
+system.set_velocities(maxwell_boltzmann(parameters.masses, T=300, replicas=1))
+
+
+starttime_force = datetime.datetime.now()
+from torchmd.forces import Forces
+forces = Forces(parameters, terms = ("bonds", "angles", "dihedrals", "impropers", "1-4", "electrostatics", "lj", "repulsion", "repulsioncg"), cutoff=9, rfa=True, switch_dist=7.5)
+endtime_force = datetime.datetime.now()
+print(endtime_force-starttime_force,'force')
+# Evaluate current energy and forces. Forces are modified in-place
+Epot = forces.compute(system.pos, system.box, system.forces, returnDetails=True)
+endtime_epot = datetime.datetime.now()
+print(endtime_epot - endtime_force ,'epot')
+
+
+print('forces:', system.forces)
+print('Epot:', Epot)
+
+
+
+
+
+# !!Dynamics
+
+from torchmd.integratorverlet import Integrator
+from torchmd.wrapper import Wrapper
+
+langevin_temperature = 300  # K
+langevin_gamma = 0.1
+timestep = 1  # fs
+
+integrator = Integrator(system, forces, timestep, device, gamma=langevin_gamma, T=langevin_temperature)
+wrapper = Wrapper(mol.numAtoms, mol.bonds if len(mol.bonds) else None, device)
+
+
+
+from torchmd.minimizers import minimize_bfgs
+starttime_minimization = datetime.datetime.now()
+minimize_bfgs(system, forces, steps=50)  
+endtime_minimization = datetime.datetime.now()
+print(endtime_minimization - starttime_minimization, 'minimize')
+
+from torchmd.utils import LogWriter
+
+logger = LogWriter(path="logs/", keys=('iter','ns','epot','ekin','etot','T'), name='monitor.csv')
+
+
+
+
+from tqdm import tqdm 
+import numpy as np
+
+FS2NS = 1E-6 # Femtosecond to nanosecond conversion
+
+steps = 100  # To 0.0001ns
+output_period = 10
+save_period = 100
+traj = []
+
+trajectoryout = "mytrajectory.npy"
+
+iterator = tqdm(range(1, int(steps / output_period) + 1))
+Epot = forces.compute(system.pos, system.box, system.forces)
+for i in iterator:
+
+    Ekin, Epot, T = integrator.step(niter=output_period, num = i)
+    wrapper.wrap(system.pos, system.box)
+    currpos = system.pos.detach().cpu().numpy().copy()
+    traj.append(currpos)
+    
+    if (i*output_period) % save_period  == 0:
+        np.save(trajectoryout, np.stack(traj, axis=2))
+
+    logger.write_row({'iter':i*output_period,'ns':FS2NS*i*output_period*timestep,'epot':Epot,'ekin':Ekin,'etot':Epot+Ekin,'T':T})
+
