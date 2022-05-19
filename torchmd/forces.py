@@ -1,23 +1,24 @@
 from scipy import constants as const
 import torch
-import yaml
 import numpy as np
 from math import pi
+import os
+import tables as t
 
 
 class Forces:
     """
-        Parameters
-        ----------
-        cutoff : float
-            If set to a value it will only calculate LJ, electrostatics and bond energies for atoms which are closer
-            than the threshold
-        rfa : bool
-            Use with `cutoff` to enable the reaction field approximation for scaling of the electrostatics up to the cutoff.
-            Uses the value of `solventDielectric` to model everything beyond the cutoff distance as solvent with uniform
-            dielectric.
-        solventDielectric : float
-            Used together with `cutoff` and `rfa`
+    Parameters
+    ----------
+    cutoff : float
+        If set to a value it will only calculate LJ, electrostatics and bond energies for atoms which are closer
+        than the threshold
+    rfa : bool
+        Use with `cutoff` to enable the reaction field approximation for scaling of the electrostatics up to the cutoff.
+        Uses the value of `solventDielectric` to model everything beyond the cutoff distance as solvent with uniform
+        dielectric.
+    solventDielectric : float
+        Used together with `cutoff` and `rfa`
     """
 
     # 1-4 is nonbonded but we put it currently in bonded to not calculate all distances
@@ -38,21 +39,16 @@ class Forces:
     ):
         self.par = parameters
         if terms is None:
-            terms = (
-                "electrostatics",
-                "lj",
-                "bonds",
-                "angles",
-                "dihedrals",
-                "1-4",
-                "impropers",
+            raise RuntimeError(
+                'Set force terms or leave empty brackets [].\nAvailable options: "bonds", "angles", "dihedrals", "impropers", "1-4", "electrostatics", "lj", "repulsion", "repulsioncg".'
             )
+
         self.energies = [ene.lower() for ene in terms]
         for et in self.energies:
             if et not in Forces.terms:
                 raise ValueError(f"Force term {et} is not implemented.")
 
-        if "1-4" in self.energies and not "dihedrals" in self.energies:
+        if "1-4" in self.energies and "dihedrals" not in self.energies:
             raise RuntimeError(
                 "You cannot enable 1-4 interactions without enabling dihedrals"
             )
@@ -66,6 +62,7 @@ class Forces:
             if self.require_distances
             else None
         )
+        self.neighborlist = None
         self.external = external
         self.cutoff = cutoff
         self.rfa = rfa
@@ -78,8 +75,19 @@ class Forces:
         for arr in arrays:
             indexedarrays.append(arr[under_cutoff])
         return indexedarrays
+    
+    def _neighbor_verlet_list(self, dist, arrays, delt_r):
+        neighbor = dist <= self.cutoff + delt_r
+        indexedarrays = []
+        for arr in arrays:
+            indexedarrays.append(arr[neighbor])
+        return indexedarrays
 
-    def compute(self, pos, box, forces, returnDetails=False, explicit_forces=True):
+    def compute(self, pos, box, forces, returnDetails=False, explicit_forces=True, itstep = None, reconstep = None, delt_r = None):
+        #I plus three more values
+        ## itstep: iteration step, the times of iteration, must start from 0.
+        ## reconstep: reconstruction step, after these steps, the verlet list need to reconstruct
+        ## delt_r: the delta radius out of the cutoff in order to consider enough molecules until reconstruction step.
         if not explicit_forces and not pos.requires_grad:
             raise RuntimeError(
                 "The positions passed don't require gradients. Please use pos.detach().requires_grad_(True) before passing."
@@ -221,6 +229,7 @@ class Forces:
                         forcevec = nb_unitvec * force_coeff[:, None]
                         forces[i].index_add_(0, idx14[:, 0], -forcevec)
                         forces[i].index_add_(0, idx14[:, 1], forcevec)
+                del aa, bb, scnb, scee, force_coeff
 
             if "impropers" in self.energies and self.par.impropers is not None:
                 _, _, r12 = calculate_distances(
@@ -250,141 +259,942 @@ class Forces:
                     forces[i].index_add_(
                         0, self.par.impropers[:, 3], improper_forces[3]
                     )
+                del r12, r23, r34, E, improper_forces
+                torch.cuda.empty_cache()
 
             # Non-bonded terms
-            if self.require_distances and len(self.ava_idx):
-                # Lazy mode: Do all vs all distances
-                # TODO: These distance calculations are fucked once we do neighbourlists since they will vary per system!!!!
-                nb_dist, nb_unitvec, _ = calculate_distances(spos, self.ava_idx, sbox)
-                ava_idx = self.ava_idx
-                if self.cutoff is not None:
-                    nb_dist, nb_unitvec, ava_idx = self._filter_by_cutoff(
-                        nb_dist, (nb_dist, nb_unitvec, ava_idx)
-                    )
+            if self.ava_idx == None:
+                ffile = t.open_file('non-interactions.h5', 'r')
+                idx = ffile.root.data
+                if self.require_distances and len(idx):
+                    import pynvml
+                    pynvml.nvmlInit()
+                    p = 0
+                    p1 = 0
+                    a1 = torch.cuda.memory_allocated()
+                    asingle = torch.tensor([1,1]).to(self.par.device)
+                    a2 = torch.cuda.memory_allocated()
+                    d = asingle.get_device()
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(d)
+                    meminfo = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    p = int(meminfo.free/(a2-a1))
+                        
+                    if itstep != None and self.cutoff != None:
+                        if reconstep == None:
+                            reconstep = 10 #reconstep is 10 by default
+                        if reconstep <= 1:
+                            raise ValueError(" reconstep can not less than 2")
+                        if itstep % reconstep == 0:
+                            while p < len(idx):
+                                self.neighborlist = torch.tensor([[]]*2, dtype=int).T.to(self.par.device)
+                                ava_idx = torch.tensor(idx[p1:p].astype(int)).to(self.par.device)
+                                nb_dist, nb_unitvec, _ = calculate_distances(spos, ava_idx, sbox)
+                                if delt_r == None:
+                                    delt_r = self.cutoff
+                                _, _, vl = self._neighbor_verlet_list(
+                                    nb_dist, (nb_dist, nb_unitvec, ava_idx), delt_r
+                                )
+                                self.neighborlist = torch.cat((self.neighborlist,vl), axis = 0)
+                                torch.cuda.empty_cache()
+                                handle = pynvml.nvmlDeviceGetHandleByIndex(d)
+                                meminfo = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                                p1 = p
+                                p = p + int(meminfo.free/(a2-a1))
 
-                for v in self.energies:
-                    if v == "electrostatics":
-                        E, force_coeff = evaluate_electrostatics(
-                            nb_dist,
-                            ava_idx,
-                            self.par.charges,
-                            cutoff=self.cutoff,
-                            rfa=self.rfa,
-                            solventDielectric=self.solventDielectric,
-                            explicit_forces=explicit_forces,
+                            if p >= len(idx):
+                                ava_idx = torch.tensor(idx[p1:].astype(int)).to(self.par.device)
+                                nb_dist, nb_unitvec, _ = calculate_distances(spos, ava_idx, sbox)
+                                if delt_r == None:
+                                    delt_r = self.cutoff
+                                _, _, vl = self._neighbor_verlet_list(
+                                    nb_dist, (nb_dist, nb_unitvec, ava_idx), delt_r
+                                )
+                                self.neighborlist = torch.cat((self.neighborlist,vl), axis = 0)
+                        
+                        if self.neighborlist == None:
+                            raise ValueError("itration step should start from 0")
+                        nbv_dist, nbv_unitvec, _ = calculate_distances(spos, self.neighborlist, sbox)
+                        nb_dist, nb_unitvec, ava_idx = self._filter_by_cutoff(
+                            nbv_dist, (nbv_dist, nbv_unitvec, self.neighborlist)
                         )
-                        pot[i][v] += E.sum()
-                    elif v == "lj":
-                        E, force_coeff = evaluate_LJ(
-                            nb_dist,
-                            ava_idx,
-                            self.par.mapped_atom_types,
-                            self.par.A,
-                            self.par.B,
-                            self.switch_dist,
-                            self.cutoff,
-                            explicit_forces,
-                        )
-                        pot[i][v] += E.sum()
-                    elif v == "repulsion":
-                        E, force_coeff = evaluate_repulsion(
-                            nb_dist,
-                            ava_idx,
-                            self.par.mapped_atom_types,
-                            self.par.A,
-                            explicit_forces,
-                        )
-                        pot[i][v] += E.sum()
-                    elif v == "repulsioncg":
-                        E, force_coeff = evaluate_repulsion_CG(
-                            nb_dist,
-                            ava_idx,
-                            self.par.mapped_atom_types,
-                            self.par.B,
-                            explicit_forces,
-                        )
-                        pot[i][v] += E.sum()
+                        for v in self.energies:
+                            if v == "electrostatics":
+                                E, force_coeff = evaluate_electrostatics(
+                                    nb_dist,
+                                    ava_idx,
+                                    self.par.charges,
+                                    cutoff=self.cutoff,
+                                    rfa=self.rfa,
+                                    solventDielectric=self.solventDielectric,
+                                    explicit_forces=explicit_forces,
+                                )
+                                pot[i][v] += E.sum()
+                            elif v == "lj":
+                                E, force_coeff = evaluate_LJ(
+                                    nb_dist,
+                                    ava_idx,
+                                    self.par.mapped_atom_types,
+                                    self.par.A,
+                                    self.par.B,
+                                    self.switch_dist,
+                                    self.cutoff,
+                                    explicit_forces,
+                                )
+                                pot[i][v] += E.sum()
+                            elif v == "repulsion":
+                                E, force_coeff = evaluate_repulsion(
+                                    nb_dist,
+                                    ava_idx,
+                                    self.par.mapped_atom_types,
+                                    self.par.A,
+                                    explicit_forces,
+                                )
+                                pot[i][v] += E.sum()
+                            elif v == "repulsioncg":
+                                E, force_coeff = evaluate_repulsion_CG(
+                                    nb_dist,
+                                    ava_idx,
+                                    self.par.mapped_atom_types,
+                                    self.par.B,
+                                    explicit_forces,
+                                )
+                                pot[i][v] += E.sum()
+                            else:
+                                continue
+                            
+                            if explicit_forces:
+                                forcevec = nb_unitvec * force_coeff[:, None]
+                                forces[i].index_add_(0, ava_idx[:, 0], -forcevec)
+                                forces[i].index_add_(0, ava_idx[:, 1], forcevec)
+                        del nb_dist, nb_unitvec, ava_idx
+                        torch.cuda.empty_cache()
+                        pynvml.nvmlShutdown()
+
                     else:
-                        continue
+                        while p < len(idx):
+                            ava_idx = torch.tensor(idx[p1:p].astype(int)).to(self.par.device)
+    #breakpoint                        print(p)
+                            nb_dist, nb_unitvec, _ = calculate_distances(spos, ava_idx, sbox)
+    #breakpoint                        print('*')
+                            if self.cutoff is not None:
+                                nb_dist, nb_unitvec, ava_idx = self._filter_by_cutoff(
+                                    nb_dist, (nb_dist, nb_unitvec, ava_idx)
+                                )
+    #breakpoint                        print(ava_idx)
+                            for v in self.energies:
+                                if v == "electrostatics":
+                                    E, force_coeff = evaluate_electrostatics(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.charges,
+                                        cutoff=self.cutoff,
+                                        rfa=self.rfa,
+                                        solventDielectric=self.solventDielectric,
+                                        explicit_forces=explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                elif v == "lj":
+                                    E, force_coeff = evaluate_LJ(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.mapped_atom_types,
+                                        self.par.A,
+                                        self.par.B,
+                                        self.switch_dist,
+                                        self.cutoff,
+                                        explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                elif v == "repulsion":
+                                    E, force_coeff = evaluate_repulsion(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.mapped_atom_types,
+                                        self.par.A,
+                                        explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                elif v == "repulsioncg":
+                                    E, force_coeff = evaluate_repulsion_CG(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.mapped_atom_types,
+                                        self.par.B,
+                                        explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                else:
+                                    continue
+                                
+                                if explicit_forces:
+                                    forcevec = nb_unitvec * force_coeff[:, None]
+                                    forces[i].index_add_(0, ava_idx[:, 0], -forcevec)
+                                    forces[i].index_add_(0, ava_idx[:, 1], forcevec)
+                            del nb_dist, nb_unitvec, ava_idx
+                            torch.cuda.empty_cache()
+                            handle = pynvml.nvmlDeviceGetHandleByIndex(d)
+                            meminfo = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                            p1 = p
+                            p = p + int(meminfo.free/(a2-a1))
+                        if p >= len(idx):
+                            ava_idx = torch.tensor(idx[p1:].astype(int)).to(self.par.device)
+                            nb_dist, nb_unitvec, _ = calculate_distances(spos, ava_idx, sbox)
+                            if self.cutoff is not None:
+                                nb_dist, nb_unitvec, ava_idx = self._filter_by_cutoff(
+                                    nb_dist, (nb_dist, nb_unitvec, ava_idx)
+                                )
+                            for v in self.energies:
+                                if v == "electrostatics":
+                                    E, force_coeff = evaluate_electrostatics(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.charges,
+                                        cutoff=self.cutoff,
+                                        rfa=self.rfa,
+                                        solventDielectric=self.solventDielectric,
+                                        explicit_forces=explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                elif v == "lj":
+                                    E, force_coeff = evaluate_LJ(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.mapped_atom_types,
+                                        self.par.A,
+                                        self.par.B,
+                                        self.switch_dist,
+                                        self.cutoff,
+                                        explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                elif v == "repulsion":
+                                    E, force_coeff = evaluate_repulsion(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.mapped_atom_types,
+                                        self.par.A,
+                                        explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                elif v == "repulsioncg":
+                                    E, force_coeff = evaluate_repulsion_CG(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.mapped_atom_types,
+                                        self.par.B,
+                                        explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                else:
+                                    continue
+                                
+                                if explicit_forces:
+                                    forcevec = nb_unitvec * force_coeff[:, None]
+                                    forces[i].index_add_(0, ava_idx[:, 0], -forcevec)
+                                    forces[i].index_add_(0, ava_idx[:, 1], forcevec)
+                            del nb_dist, nb_unitvec, ava_idx
+                            torch.cuda.empty_cache()
+                        pynvml.nvmlShutdown()
+                ffile.close()
 
-                    if explicit_forces:
-                        forcevec = nb_unitvec * force_coeff[:, None]
-                        forces[i].index_add_(0, ava_idx[:, 0], -forcevec)
-                        forces[i].index_add_(0, ava_idx[:, 1], forcevec)
+            if self.ava_idx != None and self.ava_idx.device != torch.device(self.par.device): #cuda 0 by default
+                if self.require_distances and len(self.ava_idx):
+                    import pynvml 
+                    pynvml.nvmlInit()
+                    p = 0
+                    p1 = 0
+                    a1 = torch.cuda.memory_allocated()
+                    asingle = torch.tensor([1,1]).to(self.par.device)
+                    a2 = torch.cuda.memory_allocated()
+                    d = asingle.get_device()
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(d)
+                    meminfo = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    p = int(meminfo.free*0.8/(a2-a1))
+                    if itstep != None and self.cutoff != None:
+                        if reconstep == None:
+                            reconstep = 10 #reconstep is 10 by default
+                        if reconstep <= 1:
+                            raise ValueError(" reconstep can not less than 2")
+                        if itstep % reconstep == 0:
+                            while p < len(self.ava_idx):
+                                self.neighborlist = torch.tensor([[]]*2, dtype=int).T.to(self.par.device)
+                                ava_idx = self.ava_idx[p1:p].to(self.par.device)
+                                nb_dist, nb_unitvec, _ = calculate_distances(spos, ava_idx, sbox)
+                                if delt_r == None:
+                                    delt_r = self.cutoff
+                                _, _, vl = self._neighbor_verlet_list(
+                                    nb_dist, (nb_dist, nb_unitvec, ava_idx), delt_r
+                                )
+                                self.neighborlist = torch.cat((self.neighborlist,vl), axis = 0)
+                                torch.cuda.empty_cache()
+                                handle = pynvml.nvmlDeviceGetHandleByIndex(d)
+                                meminfo = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                                p1 = p
+                                p = p + int(meminfo.free/(a2-a1))
 
+                            if p >= len(self.ava_idx):
+                                ava_idx = self.ava_idx[p1:].to(self.par.device)
+                                nb_dist, nb_unitvec, _ = calculate_distances(spos, ava_idx, sbox)
+                                _, _, vl = self._neighbor_verlet_list(
+                                    nb_dist, (nb_dist, nb_unitvec, ava_idx), delt_r
+                                )
+                                self.neighborlist = torch.cat((self.neighborlist,vl), axis = 0)
+                        
+                        if self.neighborlist == None:
+                            raise ValueError("itration step should start from 0")
+                        nbv_dist, nbv_unitvec, _ = calculate_distances(spos, self.neighborlist, sbox)
+                        nb_dist, nb_unitvec, ava_idx = self._filter_by_cutoff(
+                            nbv_dist, (nbv_dist, nbv_unitvec, self.neighborlist)
+                        )
+                        for v in self.energies:
+                            if v == "electrostatics":
+                                E, force_coeff = evaluate_electrostatics(
+                                    nb_dist,
+                                    ava_idx,
+                                    self.par.charges,
+                                    cutoff=self.cutoff,
+                                    rfa=self.rfa,
+                                    solventDielectric=self.solventDielectric,
+                                    explicit_forces=explicit_forces,
+                                )
+                                pot[i][v] += E.sum()
+                            elif v == "lj":
+                                E, force_coeff = evaluate_LJ(
+                                    nb_dist,
+                                    ava_idx,
+                                    self.par.mapped_atom_types,
+                                    self.par.A,
+                                    self.par.B,
+                                    self.switch_dist,
+                                    self.cutoff,
+                                    explicit_forces,
+                                )
+                                pot[i][v] += E.sum()
+                            elif v == "repulsion":
+                                E, force_coeff = evaluate_repulsion(
+                                    nb_dist,
+                                    ava_idx,
+                                    self.par.mapped_atom_types,
+                                    self.par.A,
+                                    explicit_forces,
+                                )
+                                pot[i][v] += E.sum()
+                            elif v == "repulsioncg":
+                                E, force_coeff = evaluate_repulsion_CG(
+                                    nb_dist,
+                                    ava_idx,
+                                    self.par.mapped_atom_types,
+                                    self.par.B,
+                                    explicit_forces,
+                                )
+                                pot[i][v] += E.sum()
+                            else:
+                                continue
+                            
+                            if explicit_forces:
+                                forcevec = nb_unitvec * force_coeff[:, None]
+                                forces[i].index_add_(0, ava_idx[:, 0], -forcevec)
+                                forces[i].index_add_(0, ava_idx[:, 1], forcevec)
+                        del nb_dist, nb_unitvec, ava_idx
+                        torch.cuda.empty_cache()
+                        pynvml.nvmlShutdown()
+                    else:
+                        while p < len(self.ava_idx):
+                            ava_idx = self.ava_idx[p1:p].to(self.par.device)
+                            nb_dist, nb_unitvec, _ = calculate_distances(spos, ava_idx, sbox)
+                            if self.cutoff is not None:
+                                nb_dist, nb_unitvec, ava_idx = self._filter_by_cutoff(
+                                    nb_dist, (nb_dist, nb_unitvec, ava_idx)
+                                )
+                            for v in self.energies:
+                                if v == "electrostatics":
+                                    E, force_coeff = evaluate_electrostatics(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.charges,
+                                        cutoff=self.cutoff,
+                                        rfa=self.rfa,
+                                        solventDielectric=self.solventDielectric,
+                                        explicit_forces=explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                elif v == "lj":
+                                    E, force_coeff = evaluate_LJ(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.mapped_atom_types,
+                                        self.par.A,
+                                        self.par.B,
+                                        self.switch_dist,
+                                        self.cutoff,
+                                        explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                elif v == "repulsion":
+                                    E, force_coeff = evaluate_repulsion(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.mapped_atom_types,
+                                        self.par.A,
+                                        explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                elif v == "repulsioncg":
+                                    E, force_coeff = evaluate_repulsion_CG(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.mapped_atom_types,
+                                        self.par.B,
+                                        explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                else:
+                                    continue
+                                
+                                if explicit_forces:
+                                    forcevec = nb_unitvec * force_coeff[:, None]
+                                    forces[i].index_add_(0, ava_idx[:, 0], -forcevec)
+                                    forces[i].index_add_(0, ava_idx[:, 1], forcevec)
+                            del nb_dist, nb_unitvec, ava_idx
+                            torch.cuda.empty_cache()
+                            handle = pynvml.nvmlDeviceGetHandleByIndex(d)
+                            meminfo = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                            p1 = p
+                            p = p + int(meminfo.free*0.8/(a2-a1))
+                        if p >= len(self.ava_idx):
+                            ava_idx = self.ava_idx[p1:].to(self.par.device)
+                            nb_dist, nb_unitvec, _ = calculate_distances(spos, ava_idx, sbox)
+                            if self.cutoff is not None:
+                                nb_dist, nb_unitvec, ava_idx = self._filter_by_cutoff(
+                                    nb_dist, (nb_dist, nb_unitvec, ava_idx)
+                                )
+                            for v in self.energies:
+                                if v == "electrostatics":
+                                    E, force_coeff = evaluate_electrostatics(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.charges,
+                                        cutoff=self.cutoff,
+                                        rfa=self.rfa,
+                                        solventDielectric=self.solventDielectric,
+                                        explicit_forces=explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                elif v == "lj":
+                                    E, force_coeff = evaluate_LJ(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.mapped_atom_types,
+                                        self.par.A,
+                                        self.par.B,
+                                        self.switch_dist,
+                                        self.cutoff,
+                                        explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                elif v == "repulsion":
+                                    E, force_coeff = evaluate_repulsion(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.mapped_atom_types,
+                                        self.par.A,
+                                        explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                elif v == "repulsioncg":
+                                    E, force_coeff = evaluate_repulsion_CG(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.mapped_atom_types,
+                                        self.par.B,
+                                        explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                else:
+                                    continue
+                                
+                                if explicit_forces:
+                                    forcevec = nb_unitvec * force_coeff[:, None]
+                                    forces[i].index_add_(0, ava_idx[:, 0], -forcevec)
+                                    forces[i].index_add_(0, ava_idx[:, 1], forcevec)
+                            del nb_dist, nb_unitvec, ava_idx
+                            torch.cuda.empty_cache()
+                            pynvml.nvmlShutdown()
+                    
+#breakpoint to monitor the cuda memory                            print(torch.cuda.memory_reserved(),'a')
+            if self.ava_idx != None and self.ava_idx.device == torch.device(self.par.device):
+                if self.require_distances and len(self.ava_idx):
+                    try:
+                        nb_dist, nb_unitvec, _ = calculate_distances(spos, self.ava_idx, sbox)
+                        ava_idx = self.ava_idx
+                        if itstep != None and self.cutoff != None:
+                            if reconstep == None:
+                                reconstep = 10 #reconstep is 10 by default
+                            if reconstep <= 1:
+                                raise ValueError(" reconstep can not less than 2")
+                            if itstep % reconstep == 0:
+                                if delt_r == None:
+                                    delt_r = self.cutoff
+                                nb_dist, nb_unitvec, self.neighborlist  = self._neighbor_verlet_list(
+                                    nb_dist, (nb_dist, nb_unitvec, ava_idx), delt_r
+                                )
+                            if self.neighborlist == None:
+                                raise ValueError("itration step should start from 0")
+                            nbv_dist, nbv_unitvec, _ = calculate_distances(spos, self.neighborlist, sbox)
+                            nb_dist, nb_unitvec, ava_idx = self._filter_by_cutoff(
+                                nbv_dist, (nbv_dist, nbv_unitvec, self.neighborlist)
+                            )
+                            for v in self.energies:
+                                if v == "electrostatics":
+                                    E, force_coeff = evaluate_electrostatics(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.charges,
+                                        cutoff=self.cutoff,
+                                        rfa=self.rfa,
+                                        solventDielectric=self.solventDielectric,
+                                        explicit_forces=explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                elif v == "lj":
+                                    E, force_coeff = evaluate_LJ(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.mapped_atom_types,
+                                        self.par.A,
+                                        self.par.B,
+                                        self.switch_dist,
+                                        self.cutoff,
+                                        explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                elif v == "repulsion":
+                                    E, force_coeff = evaluate_repulsion(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.mapped_atom_types,
+                                        self.par.A,
+                                        explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                elif v == "repulsioncg":
+                                    E, force_coeff = evaluate_repulsion_CG(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.mapped_atom_types,
+                                        self.par.B,
+                                        explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                else:
+                                    continue
+                                
+                                if explicit_forces:
+                                    forcevec = nb_unitvec * force_coeff[:, None]
+                                    forces[i].index_add_(0, ava_idx[:, 0], -forcevec)
+                                    forces[i].index_add_(0, ava_idx[:, 1], forcevec)
+                        else:
+                            if self.cutoff is not None:
+                                nb_dist, nb_unitvec, ava_idx = self._filter_by_cutoff(
+                                    nb_dist, (nb_dist, nb_unitvec, ava_idx)
+                                )
+                            for v in self.energies:
+                                if v == "electrostatics":
+                                    E, force_coeff = evaluate_electrostatics(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.charges,
+                                        cutoff=self.cutoff,
+                                        rfa=self.rfa,
+                                        solventDielectric=self.solventDielectric,
+                                        explicit_forces=explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                elif v == "lj":
+                                    E, force_coeff = evaluate_LJ(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.mapped_atom_types,
+                                        self.par.A,
+                                        self.par.B,
+                                        self.switch_dist,
+                                        self.cutoff,
+                                        explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                elif v == "repulsion":
+                                    E, force_coeff = evaluate_repulsion(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.mapped_atom_types,
+                                        self.par.A,
+                                        explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                elif v == "repulsioncg":
+                                    E, force_coeff = evaluate_repulsion_CG(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.mapped_atom_types,
+                                        self.par.B,
+                                        explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                else:
+                                    continue
+                                
+                                if explicit_forces:
+                                    forcevec = nb_unitvec * force_coeff[:, None]
+                                    forces[i].index_add_(0, ava_idx[:, 0], -forcevec)
+                                    forces[i].index_add_(0, ava_idx[:, 1], forcevec)
+                        del nb_dist, nb_unitvec, ava_idx
+                        torch.cuda.empty_cache()
+                    except RuntimeError:
+                        print('Go to the RuntimeError part')
+                        import pynvml 
+                        pynvml.nvmlInit()
+                        p = 0
+                        p1 = 0
+                        a1 = torch.cuda.memory_allocated()
+                        asingle = torch.tensor([1,1]).to(self.par.device)
+                        a2 = torch.cuda.memory_allocated()
+                        d = asingle.get_device()
+                        handle = pynvml.nvmlDeviceGetHandleByIndex(d)
+                        meminfo = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                        p = int(meminfo.free*0.8/(a2-a1))
+                        if itstep != None and self.cutoff != None:
+                            if reconstep == None:
+                                reconstep = 10 #reconstep is 10 by default
+                            if reconstep <= 1:
+                                raise ValueError(" reconstep can not less than 2")
+                            if itstep % reconstep == 0:
+                                while p < len(self.ava_idx):
+                                    self.neighborlist = torch.tensor([[]]*2, dtype=int).T.to(self.par.device)
+                                    ava_idx = self.ava_idx[p1:p]
+                                    nb_dist, nb_unitvec, _ = calculate_distances(spos, ava_idx, sbox)
+                                    if delt_r == None:
+                                        delt_r = self.cutoff
+                                    _, _, vl = self._neighbor_verlet_list(
+                                        nb_dist, (nb_dist, nb_unitvec, ava_idx), delt_r
+                                    )
+                                    self.neighborlist = torch.cat((self.neighborlist,vl), axis = 0)
+                                    torch.cuda.empty_cache()
+                                    handle = pynvml.nvmlDeviceGetHandleByIndex(d)
+                                    meminfo = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                                    p1 = p
+                                    p = p + int(meminfo.free/(a2-a1))
+                                if p >= len(self.ava_idx):
+                                    ava_idx = self.ava_idx[p1:]
+                                    nb_dist, nb_unitvec, _ = calculate_distances(spos, ava_idx, sbox)
+                                    _, _, vl = self._neighbor_verlet_list(
+                                        nb_dist, (nb_dist, nb_unitvec, ava_idx), delt_r
+                                    )
+                                    self.neighborlist = torch.cat((self.neighborlist,vl), axis = 0)
+                            if self.neighborlist == None:
+                                raise ValueError("itration step should start from 0")
+                            nbv_dist, nbv_unitvec, _ = calculate_distances(spos, self.neighborlist, sbox)
+                            nb_dist, nb_unitvec, ava_idx = self._filter_by_cutoff(
+                                nbv_dist, (nbv_dist, nbv_unitvec, self.neighborlist)
+                            )
+                            for v in self.energies:
+                                if v == "electrostatics":
+                                    E, force_coeff = evaluate_electrostatics(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.charges,
+                                        cutoff=self.cutoff,
+                                        rfa=self.rfa,
+                                        solventDielectric=self.solventDielectric,
+                                        explicit_forces=explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                elif v == "lj":
+                                    E, force_coeff = evaluate_LJ(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.mapped_atom_types,
+                                        self.par.A,
+                                        self.par.B,
+                                        self.switch_dist,
+                                        self.cutoff,
+                                        explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                elif v == "repulsion":
+                                    E, force_coeff = evaluate_repulsion(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.mapped_atom_types,
+                                        self.par.A,
+                                        explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                elif v == "repulsioncg":
+                                    E, force_coeff = evaluate_repulsion_CG(
+                                        nb_dist,
+                                        ava_idx,
+                                        self.par.mapped_atom_types,
+                                        self.par.B,
+                                        explicit_forces,
+                                    )
+                                    pot[i][v] += E.sum()
+                                else:
+                                    continue
+                                
+                                if explicit_forces:
+                                    forcevec = nb_unitvec * force_coeff[:, None]
+                                    forces[i].index_add_(0, ava_idx[:, 0], -forcevec)
+                                    forces[i].index_add_(0, ava_idx[:, 1], forcevec)
+                        else:
+                            while p < len(self.ava_idx):
+                                ava_idx = self.ava_idx[p1:p]
+                                nb_dist, nb_unitvec, _ = calculate_distances(spos, ava_idx, sbox)
+                                if self.cutoff is not None:
+                                    nb_dist, nb_unitvec, ava_idx = self._filter_by_cutoff(
+                                        nb_dist, (nb_dist, nb_unitvec, ava_idx)
+                                    )
+
+                                for v in self.energies:
+                                    if v == "electrostatics":
+                                        E, force_coeff = evaluate_electrostatics(
+                                            nb_dist,
+                                            ava_idx,
+                                            self.par.charges,
+                                            cutoff=self.cutoff,
+                                            rfa=self.rfa,
+                                            solventDielectric=self.solventDielectric,
+                                            explicit_forces=explicit_forces,
+                                        )
+                                        pot[i][v] += E.sum()
+                                    elif v == "lj":
+                                        E, force_coeff = evaluate_LJ(
+                                            nb_dist,
+                                            ava_idx,
+                                            self.par.mapped_atom_types,
+                                            self.par.A,
+                                            self.par.B,
+                                            self.switch_dist,
+                                            self.cutoff,
+                                            explicit_forces,
+                                        )
+                                        pot[i][v] += E.sum()
+                                    elif v == "repulsion":
+                                        E, force_coeff = evaluate_repulsion(
+                                            nb_dist,
+                                            ava_idx,
+                                            self.par.mapped_atom_types,
+                                            self.par.A,
+                                            explicit_forces,
+                                        )
+                                        pot[i][v] += E.sum()
+                                    elif v == "repulsioncg":
+                                        E, force_coeff = evaluate_repulsion_CG(
+                                            nb_dist,
+                                            ava_idx,
+                                            self.par.mapped_atom_types,
+                                            self.par.B,
+                                            explicit_forces,
+                                        )
+                                        pot[i][v] += E.sum()
+                                    else:
+                                        continue
+                                    
+                                    if explicit_forces:
+                                        forcevec = nb_unitvec * force_coeff[:, None]
+                                        forces[i].index_add_(0, ava_idx[:, 0], -forcevec)
+                                        forces[i].index_add_(0, ava_idx[:, 1], forcevec)
+                                del nb_dist, nb_unitvec, ava_idx
+                                torch.cuda.empty_cache()
+                                handle = pynvml.nvmlDeviceGetHandleByIndex(d)
+                                meminfo = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                                p1 = p
+                                p = p + int(meminfo.free*0.8/(a2-a1))
+                            if p >= len(self.ava_idx):
+                                ava_idx = self.ava_idx[p1:].to(self.par.device)
+                                nb_dist, nb_unitvec, _ = calculate_distances(spos, ava_idx, sbox)
+                                if self.cutoff is not None:
+                                    nb_dist, nb_unitvec, ava_idx = self._filter_by_cutoff(
+                                        nb_dist, (nb_dist, nb_unitvec, ava_idx)
+                                    )
+                                for v in self.energies:
+                                    if v == "electrostatics":
+                                        E, force_coeff = evaluate_electrostatics(
+                                            nb_dist,
+                                            ava_idx,
+                                            self.par.charges,
+                                            cutoff=self.cutoff,
+                                            rfa=self.rfa,
+                                            solventDielectric=self.solventDielectric,
+                                            explicit_forces=explicit_forces,
+                                        )
+                                        pot[i][v] += E.sum()
+                                    elif v == "lj":
+                                        E, force_coeff = evaluate_LJ(
+                                            nb_dist,
+                                            ava_idx,
+                                            self.par.mapped_atom_types,
+                                            self.par.A,
+                                            self.par.B,
+                                            self.switch_dist,
+                                            self.cutoff,
+                                            explicit_forces,
+                                        )
+                                        pot[i][v] += E.sum()
+                                    elif v == "repulsion":
+                                        E, force_coeff = evaluate_repulsion(
+                                            nb_dist,
+                                            ava_idx,
+                                            self.par.mapped_atom_types,
+                                            self.par.A,
+                                            explicit_forces,
+                                        )
+                                        pot[i][v] += E.sum()
+                                    elif v == "repulsioncg":
+                                        E, force_coeff = evaluate_repulsion_CG(
+                                            nb_dist,
+                                            ava_idx,
+                                            self.par.mapped_atom_types,
+                                            self.par.B,
+                                            explicit_forces,
+                                        )
+                                        pot[i][v] += E.sum()
+                                    else:
+                                        continue
+                                    
+                                    if explicit_forces:
+                                        forcevec = nb_unitvec * force_coeff[:, None]
+                                        forces[i].index_add_(0, ava_idx[:, 0], -forcevec)
+                                        forces[i].index_add_(0, ava_idx[:, 1], forcevec)
+                                del nb_dist, nb_unitvec, ava_idx
+                                torch.cuda.empty_cache()
+                                pynvml.nvmlShutdown()
+                    
         if self.external:
             ext_ene, ext_force = self.external.calculate(pos, box)
             for s in range(nsystems):
                 pot[s]["external"] += ext_ene[s]
             if explicit_forces:
                 forces += ext_force
+        
+        if itstep != None:
+            if not explicit_forces:
+                enesum = torch.zeros(1, device=pos.device, dtype=pos.dtype)
+                for i in range(nsystems):
+                    for ene in pot[i]:
+                        if pot[i][ene].requires_grad:
+                            enesum += pot[i][ene]
+                forces[:] = -torch.autograd.grad(
+                    enesum, pos, only_inputs=True, retain_graph=True
+                )[0]
+                if returnDetails:
+                    return pot, self.neighborlist
+                else:
+                    return [torch.sum(torch.cat(list(pp.values()))) for pp in pot], self.neighborlist
 
-        if not explicit_forces:
-            enesum = torch.zeros(1, device=pos.device, dtype=pos.dtype)
-            for i in range(nsystems):
-                for ene in pot[i]:
-                    if pot[i][ene].requires_grad:
-                        enesum += pot[i][ene]
-            forces[:] = -torch.autograd.grad(
-                enesum, pos, only_inputs=True, retain_graph=True
-            )[0]
-            return enesum
-
-        if returnDetails:
-            return [{k: v.cpu().item() for k, v in pp.items()} for pp in pot]
-        else:
-            return [np.sum([v.cpu().item() for _, v in pp.items()]) for pp in pot]
-
-    def _make_indeces(self, natoms, excludepairs, device):
-        if natoms > 10000:
-            import tables as t
-            
-            filters=t.Filters(complevel=5, complib='blosc')
-            ffile = t.open_file("findeces.h5", mode="w",title="BOOL")
-            partmat = np.full((natoms,10000),False, dtype=bool)
-            earray = ffile.create_earray(ffile.root, 'data', atom = t.Atom.from_dtype(partmat.dtype), shape=(natoms,0), filters=filters, expectedrows=natoms)
-            
-            iteration = np.floor(natoms/10000)
-            for i in range(int(iteration)):
-                earray.append(partmat)
-                
-            resmat = np.full((natoms, int(natoms-10000*iteration)), False, dtype=bool)
-            earray.append(resmat)
-            fullmat = ffile.root.data
-            
-            if len(excludepairs):
-                excludepairs = np.array(excludepairs)
-                fullmat[excludepairs[:, 0], excludepairs[:, 1]] = False
-                fullmat[excludepairs[:, 1], excludepairs[:, 0]] = False
-            
-            ind = 0
-            aa = np.array([[None, None]])
-            for i in range(natoms):
-                l = fullmat[i]
-                for j in range(i+1, natoms,1):
-                    if l[j] and ind ==0:
-                        aa[ind] = [i,j]
-                        ind = 1
-                    else:
-                        aa=np.append(aa, [[i,j]], axis=0)
-            
-            allvsall_indeces = aa
-
-            ava_idx = torch.tensor(allvsall_indeces).to(device)
-            
-            ffile.close()
-            return ava_idx
+            if returnDetails:
+                return [{k: v.cpu().item() for k, v in pp.items()} for pp in pot], self.neighborlist
+            else:
+                return [np.sum([v.cpu().item() for _, v in pp.items()]) for pp in pot], self.neighborlist
         
         else:
-            fullmat = np.full((natoms, natoms), True, dtype=bool)
-            if len(excludepairs):
+            if not explicit_forces:
+                enesum = torch.zeros(1, device=pos.device, dtype=pos.dtype)
+                for i in range(nsystems):
+                    for ene in pot[i]:
+                        if pot[i][ene].requires_grad:
+                            enesum += pot[i][ene]
+                forces[:] = -torch.autograd.grad(
+                    enesum, pos, only_inputs=True, retain_graph=True
+                )[0]
+                if returnDetails:
+                    return pot
+                else:
+                    return [torch.sum(torch.cat(list(pp.values()))) for pp in pot]
+
+            if returnDetails:
+                return [{k: v.cpu().item() for k, v in pp.items()} for pp in pot]
+            else:
+                return [np.sum([v.cpu().item() for _, v in pp.items()]) for pp in pot]
+
+    def _make_indeces(self, natoms, excludepairs, device):
+#if cpu memory is larger than the gpu's
+        ava_idx = None
+        l_excludepairs = len(excludepairs)
+        try:
+            fmatrix = np.full((natoms, natoms), True, dtype=bool)
+            if l_excludepairs:
                 excludepairs = np.array(excludepairs)
-                fullmat[excludepairs[:, 0], excludepairs[:, 1]] = False
-                fullmat[excludepairs[:, 1], excludepairs[:, 0]] = False
-            fullmat = np.triu(fullmat, +1)
-            allvsall_indeces = np.vstack(np.where(fullmat)).T
-            ava_idx = torch.tensor(allvsall_indeces).to(device)
-            return ava_idx
+                fmatrix[excludepairs[:, 0], excludepairs[:, 1]] = False
+                fmatrix[excludepairs[:, 1], excludepairs[:, 0]] = False
+            fmatrix = np.triu(fmatrix, +1)
+            ava_idx_i = np.vstack(np.where(fmatrix)).T
+#            print(torch.cuda.memory_reserved(),'a')
+            try:
+                ava_idx = torch.tensor(ava_idx_i).to(device)
+            except RuntimeError:
+                print('cuda is out of memory but the internal memory of cpu is enough')
+                torch.cuda.empty_cache()
+                #Solution: turn ava_idx to be stored in the cpu
+                ava_idx = torch.tensor(ava_idx_i).to('cpu')
+        except MemoryError:
+            print('both cpu and gpu are out of memory')
+            #Solution-2: We put the data to the outside(external memory).
+            if os.path.exists('non-interactions.h5') != True:
+                filters = t.Filters(complevel=5,complib='blosc')
+                ffile = t.open_file('non-interactions.h5', mode = 'w', title = 'index')
+                import psutil
+                import sys
+                singlesize = sys.getsizeof(np.full((1,1),True,dtype=bool))
+                length = int(psutil.virtual_memory().free/singlesize/natoms)
+                length_i = length
+                m = 0
+                length0 = 0
+                ava = np.array([[]]*2).T
+                print(psutil.virtual_memory(),'1')
+                i = 0
+                earray = ffile.create_earray(ffile.root, 'data', atom=t.Atom.from_dtype(ava.dtype), shape=(0,2), filters=filters, expectedrows=int(natoms*natoms*0.8))
+                if l_excludepairs:
+                    excludepairs = np.array(excludepairs)
+                    ex_index = np.lexsort((excludepairs[:,1],excludepairs[:,0]))
+                    excludepairs = excludepairs[ex_index]
+                while length <= natoms :
+                    fmatrix = np.full((length_i, natoms), True, dtype=bool)
+                    if l_excludepairs and m < l_excludepairs-1:
+                        for j in range(m, l_excludepairs):
+                            if excludepairs[j,0] >= length:
+                                m1 = m
+                                m = j
+                                break
+                            else:
+                                if j == l_excludepairs-1:
+                                    m1 = m
+                                    m = j+1
+                        excludepairs_i = excludepairs[m1:m]
+                        fmatrix[excludepairs_i[:, 0]-length0, excludepairs_i[:, 1]] = False
+#breakpoint                    print(i) 
+#breakpoint                    print(excludepairs_i)
+                    fmatrix = np.triu(fmatrix, length0+1)
+                    allvsall_indeces = np.vstack(np.where(fmatrix)).T
+                    allvsall_indeces = np.vstack((allvsall_indeces[:,0]+length0,allvsall_indeces[:,1])).T
+                    allvsall_indeces = allvsall_indeces.astype(int)
+                    earray.append(allvsall_indeces)
+                    i += 1
+                    length_i = int(psutil.virtual_memory().free/singlesize/natoms)
+                    length0 = length
+                    length = length + length_i
+#breakpoint                    print(len(allvsall_indeces),'**')
+                if length > natoms:
+                    fmatrix = np.full((natoms - length0, natoms), True, dtype=bool)
+                    if l_excludepairs and m < l_excludepairs:
+                        excludepairs_i = excludepairs[m:]
+                        fmatrix[excludepairs_i[:, 0] - length0, excludepairs_i[:, 1]] = False
+                    fmatrix = np.triu(fmatrix, length0+1)
+                    allvsall_indeces = np.vstack(np.where(fmatrix)).T
+                    allvsall_indeces = np.vstack((allvsall_indeces[:,0]+length0,allvsall_indeces[:,1])).T
+                    allvsall_indeces = allvsall_indeces.astype(int)
+                    earray.append(allvsall_indeces)
+                ffile.close()
+        return ava_idx
 
 
 def wrap_dist(dist, box):
