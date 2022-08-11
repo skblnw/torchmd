@@ -1126,9 +1126,10 @@ class Forces:
                 excludepairs = np.array(excludepairs)
                 fmatrix[excludepairs[:, 0], excludepairs[:, 1]] = False
                 fmatrix[excludepairs[:, 1], excludepairs[:, 0]] = False
+            np.where(fmatrix) #check the available memory 
             fmatrix = np.triu(fmatrix, +1)
             ava_idx_i = np.vstack(np.where(fmatrix)).T
-#            print(torch.cuda.memory_reserved(),'a')
+#breakpoint            print(torch.cuda.memory_reserved(),'a')
             try:
                 ava_idx = torch.tensor(ava_idx_i).to(device)
             except RuntimeError:
@@ -1150,7 +1151,7 @@ class Forces:
                 m = 0
                 length0 = 0
                 ava = np.array([[]]*2).T
-                print(psutil.virtual_memory(),'1')
+#breakpoint                print(psutil.virtual_memory(),'1')
                 i = 0
                 earray = ffile.create_earray(ffile.root, 'data', atom=t.Atom.from_dtype(ava.dtype), shape=(0,2), filters=filters, expectedrows=int(natoms*natoms*0.8))
                 if l_excludepairs:
